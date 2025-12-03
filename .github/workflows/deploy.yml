@@ -48,9 +48,17 @@ jobs:
         AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
         AWS_REGION: us-east-1
 
-    - name: Instance Refresh (Zero Downtime)
-      # Este paso usa AWS CLI directamente para rotar las instancias
+    - name: Instance Refresh (Force Update)
       run: |
+        # 1. Intentamos cancelar cualquier refresh anterior que se haya quedado colgado
+        # El "|| true" hace que si no hay nada que cancelar, no de error.
+        aws autoscaling cancel-instance-refresh --auto-scaling-group-name asg-final-pro || true
+        
+        # 2. Esperamos unos segundos para que AWS procese la cancelación
+        echo "Esperando limpieza de procesos anteriores..."
+        sleep 10
+        
+        # 3. Iniciamos el nuevo refresh con tu código nuevo
         aws autoscaling start-instance-refresh \
           --auto-scaling-group-name asg-final-pro \
           --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 120}'
