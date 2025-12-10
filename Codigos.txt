@@ -1,0 +1,707 @@
+CODIGOS
+LOS QUE VAN DENTRO DEL BACKEND DESDE AQUI
+
+backend/app.py :  -----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+from flask import Flask, jsonify
+from flask_cors import CORS
+app = Flask(__name__)
+CORS(app) 
+
+@app.route('/')
+def hello():
+    return jsonify({
+        "message": "¡Hola desde el Backend (Lab A)!",
+        "status": "Healthy",
+        "infra": "AWS ASG + Docker"
+    })
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=80)
+
+backend/Dockerfile: -----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+FROM python:3.9-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 80
+CMD ["python", "app.py"]
+
+backend/main.tf:  -----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# backend/main.tf
+
+# 1. CONFIGURACIÓN DEL ESTADO
+terraform {
+  cloud {
+    organization = "org-distribuida-carlos-practica" 
+    workspaces {
+      name = "practica-backend" 
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+# 2. VARIABLES
+variable "commit_hash" {
+  description = "Hash del commit"
+  type        = string
+  default     = "latest"
+}
+
+# 3. BUSQUEDA DE DATOS
+data "aws_ami" "al2023" {
+  most_recent = true
+  owners      = ["amazon"]
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2023.*-kernel-6.1-x86_64"]
+  }
+}
+
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "mis_subnets" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+  filter {
+    name   = "availability-zone"
+    values = ["us-east-1a", "us-east-1b", "us-east-1c"]
+  }
+}
+
+# 4. SEGURIDAD
+resource "aws_security_group" "alb_sg" {
+  name        = "alb-sg-back"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "instancia_sg" {
+  name        = "inst-sg-back"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb_sg.id]
+  }
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# 5. COMPUTO (Docker Backend)
+resource "aws_launch_template" "mi_template" {
+  name_prefix   = "lt-backend-"
+  image_id      = data.aws_ami.al2023.id
+  instance_type = "t3.micro"
+  key_name      = "Laptop"
+
+  vpc_security_group_ids = [aws_security_group.instancia_sg.id]
+
+  user_data = base64encode(<<-EOF
+              #!/bin/bash
+              # Commit Hash: ${var.commit_hash}
+              
+              dnf update -y
+              dnf install -y docker git
+              systemctl start docker
+              systemctl enable docker
+              usermod -a -G docker ec2-user
+              
+              mkdir -p /home/ec2-user/app
+              cd /home/ec2-user/app
+
+              # CLONAR EL MONOREPO
+              git clone https://github.com/carlosrm12/distribuida-examen-practica.git .
+              
+              # --- ENTRAR A LA CARPETA BACKEND ---
+              cd backend
+              
+              # Construir Docker
+              docker build -t backend .
+              
+              # Correr el contenedor
+              docker run -d -p 80:80 --restart always --name backend-container backend
+              EOF
+              )
+}
+
+# 6. LOAD BALANCER & ASG
+resource "aws_lb" "mi_alb" {
+  name               = "alb-back"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb_sg.id]
+  subnets            = data.aws_subnets.mis_subnets.ids
+}
+
+resource "aws_lb_target_group" "mi_tg" {
+  name     = "tg-back"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = data.aws_vpc.default.id
+  health_check {
+    path = "/"
+    matcher = "200"
+  }
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.mi_alb.arn
+  port              = "80"
+  protocol          = "HTTP"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.mi_tg.arn
+  }
+}
+
+resource "aws_autoscaling_group" "mi_asg" {
+  name                = "asg-back"
+  vpc_zone_identifier = data.aws_subnets.mis_subnets.ids
+  target_group_arns   = [aws_lb_target_group.mi_tg.arn]
+  
+  desired_capacity    = 2
+  max_size            = 10
+  min_size            = 2
+  
+  launch_template {
+    id      = aws_launch_template.mi_template.id
+    version = "$Latest"
+  }
+  
+  health_check_type         = "ELB"
+  health_check_grace_period = 300
+}
+
+# --- ESTA ES LA POLÍTICA QUE FALTABA Y TÚ AGREGASTE ---
+resource "aws_autoscaling_policy" "cpu_policy" {
+  name                   = "politica-cpu-back"
+  autoscaling_group_name = aws_autoscaling_group.mi_asg.name
+  policy_type            = "TargetTrackingScaling"
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ASGAverageCPUUtilization"
+    }
+    target_value = 10.0
+  }
+}
+
+output "dns_load_balancer" {
+  value = aws_lb.mi_alb.dns_name
+}
+
+backend/requirements.txt: -----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+flask
+flask-cors
+
+LO QUE VA DENTRO DEL FRONTEND DESDE AQUI
+
+frontend/Dockerfile: -----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+FROM httpd:2.4
+COPY ./index.html /usr/local/apache2/htdocs/
+
+frontend/index.html:  -----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+<!DOCTYPE html>
+<html>
+<head><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"></head>
+<body class="text-center mt-5 bg-light">
+    <h1>Frontend (Curso B)</h1>
+    <div id="data" class="alert alert-warning">Cargando datos...</div>
+    <script>
+        // LUEGO PEGARÁS EL DNS DEL BACKEND AQUÍ CON http://
+        const API_URL = "http://alb-back-987921883.us-east-1.elb.amazonaws.com"; 
+        
+        fetch(API_URL)
+            .then(r => r.json())
+            .then(d => {
+                document.getElementById('data').innerText = d.message;
+                document.getElementById('data').className = "alert alert-success";
+            })
+            .catch(e => {
+                document.getElementById('data').innerText = "Error: " + e;
+                document.getElementById('data').className = "alert alert-danger";
+            });
+    </script>
+</body>
+</html>
+
+frontend/main.tf:  --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+# frontend/main.tf
+
+# 1. CONFIGURACIÓN DEL ESTADO
+terraform {
+  cloud {
+    organization = "org-distribuida-carlos-practica" 
+    workspaces {
+      name = "practica-frontend" # <--- WORKSPACE DEL FRONT
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+# 2. VARIABLES
+variable "commit_hash" {
+  description = "Hash del commit"
+  type        = string
+  default     = "latest"
+}
+
+# 3. BUSQUEDA DE DATOS
+data "aws_ami" "al2023" {
+  most_recent = true
+  owners      = ["amazon"]
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2023.*-kernel-6.1-x86_64"]
+  }
+}
+
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "mis_subnets" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+  filter {
+    name   = "availability-zone"
+    values = ["us-east-1a", "us-east-1b", "us-east-1c"]
+  }
+}
+
+# 4. SEGURIDAD
+resource "aws_security_group" "alb_sg" {
+  name        = "alb-sg-front" # Nombre único
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "instancia_sg" {
+  name        = "inst-sg-front" # Nombre único
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb_sg.id]
+  }
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# 5. COMPUTO (Docker Frontend)
+resource "aws_launch_template" "mi_template" {
+  name_prefix   = "lt-frontend-"
+  image_id      = data.aws_ami.al2023.id
+  instance_type = "t3.micro"
+  key_name      = "Laptop"
+
+  vpc_security_group_ids = [aws_security_group.instancia_sg.id]
+
+  user_data = base64encode(<<-EOF
+              #!/bin/bash
+              # Commit Hash: ${var.commit_hash}
+              
+              dnf update -y
+              dnf install -y docker git
+              systemctl start docker
+              systemctl enable docker
+              usermod -a -G docker ec2-user
+              
+              mkdir -p /home/ec2-user/app
+              cd /home/ec2-user/app
+
+              # CLONAR EL MONOREPO
+              git clone https://github.com/carlosrm12/distribuida-examen-practica.git .
+              
+              # --- ENTRAR A LA CARPETA FRONTEND ---
+              cd frontend
+              
+              # Construir Docker
+              docker build -t frontend .
+              
+              # Correr el contenedor
+              docker run -d -p 80:80 --restart always --name frontend-container frontend
+              EOF
+              )
+}
+
+# 6. LOAD BALANCER & ASG
+resource "aws_lb" "mi_alb" {
+  name               = "alb-front"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb_sg.id]
+  subnets            = data.aws_subnets.mis_subnets.ids
+}
+
+resource "aws_lb_target_group" "mi_tg" {
+  name     = "tg-front"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = data.aws_vpc.default.id
+  health_check {
+    path = "/"
+    matcher = "200"
+  }
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.mi_alb.arn
+  port              = "80"
+  protocol          = "HTTP"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.mi_tg.arn
+  }
+}
+
+resource "aws_autoscaling_group" "mi_asg" {
+  name                = "asg-front"
+  vpc_zone_identifier = data.aws_subnets.mis_subnets.ids
+  target_group_arns   = [aws_lb_target_group.mi_tg.arn]
+  
+  desired_capacity    = 2
+  max_size            = 10
+  min_size            = 2
+  
+  launch_template {
+    id      = aws_launch_template.mi_template.id
+    version = "$Latest"
+  }
+  
+  health_check_type         = "ELB"
+  health_check_grace_period = 300
+}
+
+# --- AQUI ESTA LA POLITICA DE CPU PARA EL FRONTEND ---
+resource "aws_autoscaling_policy" "cpu_policy" {
+  name                   = "politica-cpu-front"
+  autoscaling_group_name = aws_autoscaling_group.mi_asg.name
+  policy_type            = "TargetTrackingScaling"
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ASGAverageCPUUtilization"
+    }
+    target_value = 10.0
+  }
+}
+
+output "dns_load_balancer" {
+  value = aws_lb.mi_alb.dns_name
+}
+
+LO QUE VA DENTRO DE LA CARPETA ".github" DESDE AQUI, TEN EN CUENTA QUE DENTRO DE ".github" VA UNA CARPETA LLAMADA "workflows" Y DENTRO DE ESO VAN LOS CODIGOS
+
+.github/workflows/deploy-backend.yml: -----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+name: Deploy Backend (Curso A)
+on:
+  push:
+    paths: ['backend/**'] # TRIGGER: Solo si cambia la carpeta backend
+    branches: ['main']
+  workflow_dispatch:
+
+# Evita que se solapen dos despliegues del backend
+concurrency:
+  group: backend-deploy
+  cancel-in-progress: true
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./backend # IMPORTANTE: Entrar a la carpeta
+
+    steps:
+    - uses: actions/checkout@v3
+    - uses: hashicorp/setup-terraform@v1
+      with:
+        cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+    - run: terraform init
+      env:
+        TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+        # CREDENCIALES A
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_A_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_A_SECRET_ACCESS_KEY }}
+        AWS_SESSION_TOKEN: ${{ secrets.AWS_A_SESSION_TOKEN }}
+        AWS_REGION: us-east-1
+
+    - run: terraform apply -auto-approve -var="commit_hash=${{ github.sha }}"
+      env:
+        TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_A_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_A_SECRET_ACCESS_KEY }}
+        AWS_SESSION_TOKEN: ${{ secrets.AWS_A_SESSION_TOKEN }}
+        AWS_REGION: us-east-1
+
+    # --- NUEVO BLOQUE DE ACTUALIZACIÓN AUTOMÁTICA ---
+    - name: Instance Refresh (Smart Wait)
+      run: |
+        echo "1. Cancelando refrescos anteriores..."
+        # Nota: El nombre del ASG en el backend/main.tf es 'asg-back'
+        aws autoscaling cancel-instance-refresh --auto-scaling-group-name asg-back || true
+        
+        echo "2. Esperando limpieza de estado..."
+        while true; do
+          STATUS=$(aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name asg-back \
+            --query 'InstanceRefreshes[0].Status' --output text)
+            
+          echo "Estado actual: $STATUS"
+          if [ "$STATUS" == "None" ] || [ "$STATUS" == "Cancelled" ] || [ "$STATUS" == "Successful" ] || [ "$STATUS" == "Failed" ]; then
+            break
+          fi
+          sleep 5
+        done
+        
+        echo "3. Iniciando nuevo refresco..."
+        # AQUI ESTA EL CAMBIO: Warmup de 60 segundos
+        aws autoscaling start-instance-refresh \
+          --auto-scaling-group-name asg-back \
+          --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 60}'
+      env:
+        # USAMOS CREDENCIALES DEL CURSO A
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_A_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_A_SECRET_ACCESS_KEY }}
+        AWS_SESSION_TOKEN: ${{ secrets.AWS_A_SESSION_TOKEN }}
+        AWS_REGION: us-east-1
+
+.github/workflows/deploy-frontend.yml: ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+name: Deploy Frontend (Curso B)
+on:
+  push:
+    paths: ['frontend/**']
+    branches: ['main']
+  workflow_dispatch:
+
+concurrency:
+  group: frontend-deploy
+  cancel-in-progress: true
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./frontend # SITUARSE EN FRONTEND
+
+    steps:
+    - uses: actions/checkout@v3
+    - uses: hashicorp/setup-terraform@v1
+      with:
+        cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+    - run: terraform init
+      env:
+        TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_B_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_B_SECRET_ACCESS_KEY }}
+        AWS_SESSION_TOKEN: ${{ secrets.AWS_B_SESSION_TOKEN }}
+        AWS_REGION: us-east-1
+
+    - run: terraform apply -auto-approve -var="commit_hash=${{ github.sha }}"
+      env:
+        TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_B_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_B_SECRET_ACCESS_KEY }}
+        AWS_SESSION_TOKEN: ${{ secrets.AWS_B_SESSION_TOKEN }}
+        AWS_REGION: us-east-1
+
+    # --- BLOQUE DE ACTUALIZACIÓN CON WARMUP DE 60s ---
+    - name: Instance Refresh (Smart Wait)
+      run: |
+        echo "1. Cancelando refrescos anteriores..."
+        aws autoscaling cancel-instance-refresh --auto-scaling-group-name asg-front || true
+        
+        echo "2. Esperando limpieza de estado..."
+        while true; do
+          STATUS=$(aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name asg-front \
+            --query 'InstanceRefreshes[0].Status' --output text)
+            
+          echo "Estado actual: $STATUS"
+          if [ "$STATUS" == "None" ] || [ "$STATUS" == "Cancelled" ] || [ "$STATUS" == "Successful" ] || [ "$STATUS" == "Failed" ]; then
+            break
+          fi
+          sleep 5
+        done
+        
+        echo "3. Iniciando nuevo refresco..."
+        # CAMBIO: InstanceWarmup a 60 segundos por seguridad
+        aws autoscaling start-instance-refresh \
+          --auto-scaling-group-name asg-front \
+          --preferences '{"MinHealthyPercentage": 50, "InstanceWarmup": 60}'
+      env:
+        # IMPORTANTE: USAR CREDENCIALES DEL CURSO B
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_B_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_B_SECRET_ACCESS_KEY }}
+        AWS_SESSION_TOKEN: ${{ secrets.AWS_B_SESSION_TOKEN }}
+        AWS_REGION: us-east-1
+
+.github/workflows/destroy-backend.yml: ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+name: DESTRUIR Backend (Curso A)
+
+on:
+  workflow_dispatch: # Botón manual
+
+jobs:
+  destroy:
+    name: 'Terraform Destroy Backend'
+    runs-on: ubuntu-latest
+    
+    # IMPORTANTE: Esto le dice al robot que entre a la carpeta backend antes de empezar
+    defaults:
+      run:
+        working-directory: ./backend
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v1
+      with:
+        terraform_version: 1.5.0
+        cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+    - name: Terraform Init
+      run: terraform init
+      env:
+        TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+        # USAMOS CREDENCIALES DEL CURSO A
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_A_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_A_SECRET_ACCESS_KEY }}
+        AWS_SESSION_TOKEN: ${{ secrets.AWS_A_SESSION_TOKEN }}
+        AWS_REGION: us-east-1
+
+    - name: Terraform Destroy
+      run: terraform destroy -auto-approve
+      env:
+        TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+        # USAMOS CREDENCIALES DEL CURSO A
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_A_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_A_SECRET_ACCESS_KEY }}
+        AWS_SESSION_TOKEN: ${{ secrets.AWS_A_SESSION_TOKEN }}
+        AWS_REGION: us-east-1
+
+.github/workflows/destroy-frontend.yml: ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+name: DESTRUIR Frontend (Curso B)
+
+on:
+  workflow_dispatch: # Botón manual
+
+jobs:
+  destroy:
+    name: 'Terraform Destroy Frontend'
+    runs-on: ubuntu-latest
+
+    # IMPORTANTE: Esto le dice al robot que entre a la carpeta frontend antes de empezar
+    defaults:
+      run:
+        working-directory: ./frontend
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v1
+      with:
+        terraform_version: 1.5.0
+        cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+    - name: Terraform Init
+      run: terraform init
+      env:
+        TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+        # USAMOS CREDENCIALES DEL CURSO B
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_B_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_B_SECRET_ACCESS_KEY }}
+        AWS_SESSION_TOKEN: ${{ secrets.AWS_B_SESSION_TOKEN }}
+        AWS_REGION: us-east-1
+
+    - name: Terraform Destroy
+      run: terraform destroy -auto-approve
+      env:
+        TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+        # USAMOS CREDENCIALES DEL CURSO B
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_B_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_B_SECRET_ACCESS_KEY }}
+        AWS_SESSION_TOKEN: ${{ secrets.AWS_B_SESSION_TOKEN }}
+        AWS_REGION: us-east-1
+
+
+
+
