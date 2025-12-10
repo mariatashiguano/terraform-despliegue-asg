@@ -703,5 +703,71 @@ jobs:
         AWS_REGION: us-east-1
 
 
+DESDE AQUI VAN LOS PASOS DEL 1 AL 9 DE COMO HACERLO: ----------------------------------------------------------------------------------------------------------------------------------------
+
+1ro: crear repositorio nuevo
+
+2do: clonar el repositorio nuevo con git clone dentro de alguna carpeta
+
+3ro: crear 2 workspaces nuevos (puedes usar alguna organizacion que ya este creada, solo tienes que fijarte en los main.tf que coincida el nombre de la organizacion y los workspaces, al crear el wokspace seleccionas cli-driven wokrflow,de ahi en configuracion vas a general y donde dice execution mode seleccionas local(custom), en ambos
+
+4to: Preparar AWS, inicias dos laboratorios y haces esto -> vas a ec2 luego a key pairs (o grupo de llaves) y creas una nueva con nombre "Pr1" o el que quieras, pero ambos laboratorios deben tener la misma llave, primero hazlo en un laboratorio luego cierralo sin apagarlo y luego en el otro
+
+5to: Entra en la carpeta que se descargo al hacer el git clone, allí dentro crea estas carpetas y archivos:
+
+            .
+├── .github/
+│   └── workflows/
+│       ├── deploy-backend.yml
+│       ├── deploy-frontend.yml
+│       ├── destroy-backend.yml
+│       └── destroy-frontend.yml
+├── backend/
+│   ├── app.py
+│   ├── Dockerfile
+│   ├── main.tf
+│   └── requirements.txt
+└── frontend/
+    ├── Dockerfile
+    ├── index.html
+    └── main.tf
+
+Sera mas sencillo si abres la carpeta del git clone dentro de vscode y creas las carpetas y archivos desde allí, fíjate en la jerarquía de las carpetas, te tiene que 
+
+6to: Codigos que ya estan arriba, aqui te voy a especificar las cosas que debes tener en cuenta y en que archivos:
+
+backend/main.tf : 
+(Para el main.tf del backend y del frontend tienes que fijarte en tres cosas al inicio estarán organization y workspaces como variables, ahí tienes que poner el nombre de la organización de terraform cloud y en workspaces el nombre de los workspaces que recién creamos, el de back para el back y de front para el front, luego abajo del mismo código en el paso 5 hay una variable llamada “key_name” ahí tienes que poner Pr1 o la llave que hayas creado en los laboratorios, además en el literal 5 computo dentro de user_data tienes que fijarte en la parte que dice git clone, ahí debes reemplazar ese url con el de tu nuevo repo) 
+
+
+Frontend/index.html : 
+(Aqui hay una variable llamada const API_URL que te dice que le cambies por el dns del backend, eso se hará después del primer deploy, ahí deberás ir al deploy del backend en el git actions y buscar el dns, luego editarlo en el index.html del frontend, vas a ver que el dns te lo da empezando por “alb-algo-blablabla” tienes que copiar eso y pegarlo en la variable pero agregarle el http:// al inicio)
+
+Frontend/main.tf : 
+(Aqui igual cambias organización, workspace, key_name y git clone)
+
+
+
+7MO Secretos:
+Necesitas 7 secretos:
+-	TF_API_TOKEN
+-	AWS_A_ACCESS_KEY_ID
+-	AWS_A_SECRET_ACCESS_KEY
+-	AWS_A_SESSION_TOKEN
+-	AWS_B_ACCESS_KEY_ID
+-	AWS_B_SECRET_ACCESS_KEY
+-	AWS_B_SESSION_TOKEN
+El TF_API_TOKEN lo consigues en terraform cloud, vas a account setting, luego en el menú de la izquierda a tokens, creas uno con cualquier nombre y el token que te de lo copias y lo metes a los secretos, lo mismo con los de aws, los 3 secretos A son de un laboratorio y los 3 secretos B del otro
+
+
+8vo push:
+Desde un git bash dentro de la carpeta donde hiciste todo haces un git add .  Luego un git commit -m “Algun mensaje” y un git push origin main
+
+
+9vo que pasara:
+Despues de que hayas hecho un push de todo veras que en el actions empezara a construir dos procesos en amarillo, espera a que se pongan en verde y luego entra al que en la izquierda dice Deploy Backend (Curso A)
+
+
+
 
 
